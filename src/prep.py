@@ -2992,17 +2992,19 @@ class Prep():
                         console.print(f"[red]Error during upload for {image}: {str(e)}")
                         return []  # Return empty list in case of error
 
+            console.print(f"[green]Successfully uploaded all {len(image_list)} images to imgbox.")
+            return image_list
             # After uploading all images, validate URLs and get sizes
-            valid_images = await self.check_images_concurrently(image_list, meta)
+            #valid_images = await self.check_images_concurrently(image_list, meta)
 
-            if valid_images:
-                console.print(f"[yellow]Successfully uploaded and validated {len(valid_images)} images.")
-                return_dict['image_list'] = valid_images  # Set the validated images in return_dict
-            else:
-                console.print("[red]Failed to validate any images.")
-                return []  # Return empty list if no valid images
+            #if valid_images:
+            #    console.print(f"[yellow]Successfully uploaded and validated {len(valid_images)} images.")
+            #    return_dict['image_list'] = valid_images  # Set the validated images in return_dict
+            #else:
+            #    console.print("[red]Failed to validate any images.")
+            #    return []  # Return empty list if no valid images
 
-            return valid_images  # Return the valid image list after validation
+            #return valid_images  # Return the valid image list after validation
 
         except Exception as e:
             console.print(f"[red]An error occurred while uploading images to imgbox: {str(e)}")
