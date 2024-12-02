@@ -47,9 +47,6 @@ class OE():
         pass
 
     async def upload(self, meta, disctype):
-        if 'concert' in meta['keywords']:
-            console.print('[bold red]Concerts not allowed.')
-            return
         common = COMMON(config=self.config)
         await common.edit_torrent(meta, self.tracker, self.source_flag)
         await self.edit_desc(meta, self.tracker, self.signature)
@@ -112,7 +109,7 @@ class OE():
             data['season_number'] = meta.get('season_int', '0')
             data['episode_number'] = meta.get('episode_int', '0')
         headers = {
-            'User-Agent': f'Upload Assistant/2.1 ({platform.system()} {platform.release()})'
+            'User-Agent': f'Upload Assistant/2.2 ({platform.system()} {platform.release()})'
         }
         params = {
             'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip()
@@ -138,6 +135,8 @@ class OE():
         resolution = meta.get('resolution')
         video_encode = meta.get('video_encode')
         name_type = meta.get('type', "")
+        tag_lower = meta['tag'].lower()
+        invalid_tags = ["nogrp", "nogroup", "unknown", "-unk-"]
 
         if name_type == "DVDRIP":
             if meta.get('category') == "MOVIE":
@@ -175,6 +174,11 @@ class OE():
                         oe_name = oe_name.replace(meta['resolution'], f"{audio_lang} {meta['resolution']}", 1)
             except (FileNotFoundError, KeyError) as e:
                 print(f"Error processing MEDIAINFO.txt: {e}")
+
+        if meta['tag'] == "" or any(invalid_tag in tag_lower for invalid_tag in invalid_tags):
+            for invalid_tag in invalid_tags:
+                oe_name = re.sub(f"-{invalid_tag}", "", oe_name, flags=re.IGNORECASE)
+            oe_name = f"{oe_name}-NOGRP"
 
         return oe_name
 
@@ -295,8 +299,7 @@ class OE():
             desc = base
             desc = bbcode.convert_pre_to_code(desc)
             desc = bbcode.convert_hide_to_spoiler(desc)
-            if comparison is False:
-                desc = bbcode.convert_comparison_to_collapse(desc, 1000)
+            desc = bbcode.convert_comparison_to_collapse(desc, 1000)
 
             desc = desc.replace('[img]', '[img=300]')
             descfile.write(desc)
@@ -314,6 +317,10 @@ class OE():
         return
 
     async def search_existing(self, meta, disctype):
+        if 'concert' in meta['keywords']:
+            console.print('[bold red]Concerts not allowed.')
+            meta['skipping'] = "OE"
+            return
         dupes = []
         console.print("[yellow]Searching for existing torrents on site...")
         params = {

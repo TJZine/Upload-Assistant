@@ -1139,6 +1139,8 @@ class Prep():
                 meta['scene_name'] = first_result['release']
                 video = f"{first_result['release']}.mkv"
                 scene = True
+                if scene and meta.get('isdir', False) and meta.get('queue') is not None:
+                    meta['keep_folder'] = True
 
                 # NFO Download Handling
                 if first_result.get("hasNFO") == "yes":
@@ -2810,14 +2812,13 @@ class Prep():
         nest_asyncio.apply()
         os.chdir(f"{meta['base_dir']}/tmp/{meta['uuid']}")
         initial_img_host = self.config['DEFAULT'][f'img_host_{img_host_num}']
-        img_host = meta['imghost']  # Use the correctly updated image host from meta
+        img_host = meta['imghost']
         using_custom_img_list = bool(custom_img_list)
 
         image_list = []
-        successfully_uploaded = set()  # Track successfully uploaded images
-        initial_timeout = 10  # Set the initial timeout for backoff
+        successfully_uploaded = set()
+        initial_timeout = 10
 
-        # Initialize the meta key for image sizes if not already present
         if 'image_sizes' not in meta:
             meta['image_sizes'] = {}
 
@@ -2834,16 +2835,6 @@ class Prep():
             console.print(f"[yellow]Skipping upload because images are already uploaded to {img_host}. Existing images: {len(existing_images)}, Required: {total_screens}")
             return existing_images, total_screens
 
-        def exponential_backoff(retry_count, initial_timeout):
-            # Exponential backoff logic with jitter
-            if retry_count == 1:
-                backoff_time = initial_timeout
-            else:
-                backoff_time = initial_timeout * (1.5 ** (retry_count - 1))
-            backoff_time += random.uniform(0, 1)
-            time.sleep(backoff_time)
-            return backoff_time
-
         while True:
             remaining_images = [img for img in image_glob[-screens:] if img not in successfully_uploaded]
 
@@ -2855,20 +2846,17 @@ class Prep():
             ) as progress:
                 upload_task = progress.add_task("[green]Uploading Screens...", total=len(remaining_images))
                 console.print(f"[cyan]Uploading screens to {img_host}...")
-                # console.print(f"[debug] Remaining images to upload: {remaining_images}")
+
                 for image in remaining_images:
                     retry_count = 0
                     upload_success = False
 
-                    # Ensure the correct image path is assigned here
                     image_path = os.path.normpath(os.path.join(os.getcwd(), image))  # noqa F841
-                    # console.print(f"[debug] Normalized image path: {image_path}")
 
                     while retry_count < max_retries and not upload_success:
                         try:
-                            timeout = exponential_backoff(retry_count + 1, initial_timeout)
+                            timeout = initial_timeout
 
-                            # Add imgbox handling here
                             if img_host == "imgbox":
                                 try:
                                     # console.print("[blue]Uploading images to imgbox...")
@@ -3021,22 +3009,21 @@ class Prep():
                                     'web_url': web_url
                                 }
                                 image_list.append(image_dict)
-                                successfully_uploaded.add(image)  # Track the uploaded image
+                                successfully_uploaded.add(image)
 
                                 # Store size in meta, indexed by the img_url
                                 # Storing image_sizes for any multi disc/files will probably break something, so lets not do that.
                                 if not using_custom_img_list:
-                                    meta['image_sizes'][img_url] = image_size  # Keep sizes separate in meta['image_sizes']
+                                    meta['image_sizes'][img_url] = image_size
 
                                 progress.advance(upload_task)
-                                i += 1  # Increment the image counter only after success
+                                i += 1
                                 return_dict['image_list'] = image_list
-                                break  # Break retry loop after a successful upload
+                                break
 
                         except Exception as e:
                             retry_count += 1
                             console.print(f"[yellow]Failed to upload {image} to {img_host}. Attempt {retry_count}/{max_retries}. Exception: {str(e)}")
-                            exponential_backoff(retry_count, initial_timeout)
 
                             if retry_count >= max_retries:
                                 next_img_host = self.config['DEFAULT'].get(f'img_host_{img_host_num + 1}', 'No more hosts')
@@ -3048,11 +3035,10 @@ class Prep():
                                     return image_list, i
                                 break
 
-                # Exit the loop after switching hosts
                 if img_host_num > 1 and not upload_success:
-                    continue  # Continue to the next host
+                    continue
                 else:
-                    break  # Break if upload was successful
+                    break
 
         return image_list, i
 
@@ -3107,6 +3093,8 @@ class Prep():
         title = meta.get('title', "")
         alt_title = meta.get('aka', "")
         year = meta.get('year', "")
+        if meta.get('manual_year') > 0:
+            year = meta.get('manual_year')
         resolution = meta.get('resolution', "")
         if resolution == "OTHER":
             resolution = ""
@@ -3202,7 +3190,7 @@ class Prep():
             elif type == "REMUX" and source in ("BluRay", "HDDVD"):  # BluRay Remux
                 name = f"{title} {year} {alt_title} {season}{episode} {episode_title} {part} {three_d} {edition} {repack} {resolution} {uhd} {source} REMUX {hdr} {video_codec} {audio}"  # SOURCE
                 potential_missing = ['edition', 'description']
-            elif type == "REMUX" and source in ("PAL DVD", "NTSC DVD"):  # DVD Remux
+            elif type == "REMUX" and source in ("PAL DVD", "NTSC DVD", "DVD"):  # DVD Remux
                 name = f"{title} {year} {alt_title} {season}{episode} {episode_title} {part} {edition} {repack} {source} REMUX {audio}"  # SOURCE
                 potential_missing = ['edition', 'description']
             elif type == "ENCODE":  # Encode

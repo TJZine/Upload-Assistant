@@ -86,7 +86,7 @@ class LST():
         modq = await self.get_flag(meta, 'modq')
         draft = await self.get_flag(meta, 'draft')
         name = await self.edit_name(meta)
-        await common.unit3d_edit_desc(meta, self.tracker, self.signature)
+        await common.unit3d_edit_desc(meta, self.tracker, self.signature, comparison=True)
         region_id = await common.unit3d_region_ids(meta.get('region'))
         distributor_id = await common.unit3d_distributor_ids(meta.get('distributor'))
         if meta['anon'] == 0 and bool(str2bool(str(self.config['TRACKERS'][self.tracker].get('anon', "False")))) is False:
@@ -156,7 +156,7 @@ class LST():
             data['season_number'] = meta.get('season_int', '0')
             data['episode_number'] = meta.get('episode_int', '0')
         headers = {
-            'User-Agent': f'Upload Assistant/2.1 ({platform.system()} {platform.release()})'
+            'User-Agent': f'Upload Assistant/2.2 ({platform.system()} {platform.release()})'
         }
         params = {
             'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip()

@@ -61,9 +61,6 @@ class ANT():
         return flags
 
     async def upload(self, meta, disctype):
-        if meta.get('category') == "TV":
-            console.print('[bold red]This site only ALLOWS Movies.')
-            return
         common = COMMON(config=self.config)
         torrent_filename = "BASE"
         torrent_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/BASE.torrent"
@@ -116,12 +113,12 @@ class ANT():
                 'media': 'Blu-ray',
                 'releasegroup': str(meta['tag'])[1:],
                 'release_desc': bd_dump,
-                'flagchangereason': "BDMV Uploaded with L4G's Upload Assistant"})
+                'flagchangereason': "BDMV Uploaded with Upload Assistant"})
         if meta['scene']:
             # ID of "Scene?" checkbox on upload form is actually "censored"
             data['censored'] = 1
         headers = {
-            'User-Agent': f'Upload Assistant/2.1 ({platform.system()} {platform.release()})'
+            'User-Agent': f'Upload Assistant/2.2 ({platform.system()} {platform.release()})'
         }
 
         try:
@@ -145,6 +142,10 @@ class ANT():
         return
 
     async def search_existing(self, meta, disctype):
+        if meta.get('category') == "TV":
+            console.print('[bold red]This site only ALLOWS Movies.')
+            meta['skipping'] = "ANT"
+            return
         dupes = []
         console.print("[yellow]Searching for existing torrents on site...")
         params = {

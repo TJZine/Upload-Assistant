@@ -42,11 +42,6 @@ class HUNO():
         else:
             anon = 1
 
-        # adding logic to check if its an encode or webrip and not HEVC as only HEVC encodes and webrips are allowed
-        if meta['video_codec'] != "HEVC" and (meta['type'] == "ENCODE" or meta['type'] == "WEBRIP"):
-            console.print('[bold red]Only x265/HEVC encodes are allowed')
-            return
-
         if meta['bdinfo'] is not None:
             mi_dump = None
             bd_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/BD_SUMMARY_00.txt", 'r', encoding='utf-8').read()
@@ -89,7 +84,7 @@ class HUNO():
                 data['internal'] = 0
 
         headers = {
-            'User-Agent': f'Upload Assistant/2.1 ({platform.system()} {platform.release()})'
+            'User-Agent': f'Upload Assistant/2.2 ({platform.system()} {platform.release()})'
         }
         params = {
             'api_token': tracker_config['api_key'].strip()
@@ -277,6 +272,10 @@ class HUNO():
         return 0
 
     async def search_existing(self, meta, disctype):
+        if meta['video_codec'] != "HEVC" and (meta['type'] == "ENCODE" or meta['type'] == "WEBRIP"):
+            console.print('[bold red]Only x265/HEVC encodes are allowed')
+            meta['skipping'] = "HUNO"
+            return
         dupes = []
         console.print("[yellow]Searching for existing torrents on site...")
 
