@@ -448,6 +448,18 @@ async def tmdb_other_meta(
 
         # Make the main API call to get basic data
         response = await client.get(main_url, params={"api_key": TMDB_API_KEY})
+
+        if response.status_code == 404:
+            # Category might be wrong, try the other one
+            new_category = "MOVIE" if category == "TV" else "TV"
+            main_url = f"{TMDB_BASE_URL}/{('movie' if new_category == 'MOVIE' else 'tv')}/{tmdb_id}"
+            response = await client.get(main_url, params={"api_key": TMDB_API_KEY})
+            if response.status_code == 200:
+                # Update category if successful
+                category = new_category
+                if debug:
+                    console.print(f"[yellow]Switched category to {category} and found match.[/yellow]")
+
         try:
             response.raise_for_status()
             media_data = response.json()
