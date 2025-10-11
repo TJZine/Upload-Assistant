@@ -72,6 +72,8 @@ Better just to be on this fork and bug me about my bugs, rather than bugging som
       - On Windows systems, ffmpeg must be added to PATH (https://windowsloop.com/install-ffmpeg-windows-10/)
       - On linux systems, get it from your favorite package manager
       - If you have issues with ffmpeg, such as `max workers` errors, see this [wiki](https://github.com/Audionut/Upload-Assistant/wiki/ffmpeg---max-workers-issues)
+   - To force Upload Assistant to use a specific FFmpeg binary, export `UA_FFMPEG_BIN` before running the tool (for example: `UA_FFMPEG_BIN="$PWD/bin/ffmpeg/ffmpeg" python3 upload.py ...`). On seedboxes it is often sufficient to extend `PATH` (`PATH="$PWD/bin/ffmpeg:$PATH" python3 upload.py ...`).
+   - When troubleshooting FFmpeg failures you can pass `--debug` to print the exact FFmpeg command along with the first lines of stderr for each failed invocation.
    - Get the source:
       - Clone the repo to your system `git clone https://github.com/Audionut/Upload-Assistant.git`
       - Fetch all of the release tags `git fetch --all --tags`
