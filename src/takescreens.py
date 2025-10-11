@@ -2,7 +2,6 @@ import os
 import re
 import glob
 import time
-import ffmpeg
 import random
 import json
 import platform
@@ -14,10 +13,20 @@ import concurrent.futures
 import signal
 import gc
 import traceback
+import ffmpeg
+from typing import Iterable
 from pymediainfo import MediaInfo
 from src.console import console
 from data.config import config
 from src.cleanup import cleanup, reset_terminal
+from src.utils.ffmpeg import (
+    FFMPEG_BINARY,
+    format_command_for_logging,
+    prepare_ffmpeg_command,
+    prepare_ffmpeg_object,
+    preview_stderr,
+)
+from src.utils.workers import compute_worker_count
 
 task_limit = int(config['DEFAULT'].get('process_limit', 1))
 threads = str(config['DEFAULT'].get('threads', '1'))
@@ -36,27 +45,39 @@ algorithm = config['DEFAULT'].get('algorithm', 'mobius').strip()
 desat = float(config['DEFAULT'].get('desat', 10.0))
 
 
-async def run_ffmpeg(command):
-    if platform.system() == 'Linux':
-        ffmpeg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'bin', 'ffmpeg', 'ffmpeg')
-        if os.path.exists(ffmpeg_path):
-            cmd_list = command.compile()
-            cmd_list[0] = ffmpeg_path
+async def run_ffmpeg(
+    command: Iterable[str] | ffmpeg.nodes.FilterableStream,
+    *,
+    debug: bool = False,
+    command_name: str = "ffmpeg",
+    stderr_preview_lines: int = 40,
+):
+    if hasattr(command, "compile"):
+        cmd_list = prepare_ffmpeg_object(command)
+    else:
+        cmd_list = prepare_ffmpeg_command(list(command))
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd_list,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            return process.returncode, stdout, stderr
+    if debug:
+        console.print(
+            f"[cyan]FFmpeg command ({command_name}): {format_command_for_logging(cmd_list)}[/cyan]",
+            emoji=False,
+        )
 
     process = await asyncio.create_subprocess_exec(
-        *command.compile(),
+        *cmd_list,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await process.communicate()
+
+    if debug and process.returncode != 0:
+        preview = preview_stderr(stderr, limit=stderr_preview_lines)
+        if preview:
+            console.print(
+                f"[red]FFmpeg stderr ({command_name}):\n{preview}[/red]",
+                emoji=False,
+            )
+
     return process.returncode, stdout, stderr
 
 
@@ -151,7 +172,7 @@ async def disc_screenshots(meta, filename, bdinfo, folder_id, base_dir, use_vs, 
         if meta['debug']:
             console.print(f"[cyan]Collected frame information for {len(frame_info_results)} frames")
 
-    num_workers = min(num_screens, task_limit)
+    num_workers = compute_worker_count(num_screens, task_limit)
 
     if meta['debug']:
         console.print(f"Using {num_workers} worker(s) for {num_screens} image(s)")
@@ -170,7 +191,7 @@ async def disc_screenshots(meta, filename, bdinfo, folder_id, base_dir, use_vs, 
         existing_indices = {int(p.split('-')[-1].split('.')[0]) for p in existing_screens}
 
         # Create semaphore to limit concurrent tasks
-        semaphore = asyncio.Semaphore(task_limit)
+        semaphore = asyncio.Semaphore(max(1, num_workers))
 
         async def capture_disc_with_semaphore(*args):
             async with semaphore:
@@ -221,30 +242,41 @@ async def disc_screenshots(meta, filename, bdinfo, folder_id, base_dir, use_vs, 
 
         # Dynamically determine the number of processes
         if optimize_images:
+            num_tasks = len(valid_images)
+            num_workers = compute_worker_count(num_tasks, task_limit)
+
+            if num_workers == 0:
+                console.print("[red]No valid images found for optimization.[/red]")
+                return []
+
             if meta['debug']:
                 console.print("[yellow]Now optimizing images...[/yellow]")
 
             loop = asyncio.get_running_loop()
-            stop_event = asyncio.Event()
+            executor: concurrent.futures.ProcessPoolExecutor | None = None
 
             def handle_sigint(sig, frame):
                 console.print("\n[red]CTRL+C detected. Cancelling optimization...[/red]")
-                executor.shutdown(wait=False)
-                stop_event.set()
+                if executor is not None:
+                    executor.shutdown(wait=False)
                 for task in asyncio.all_tasks(loop):
                     task.cancel()
 
             signal.signal(signal.SIGINT, handle_sigint)
 
             try:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                    tasks = [asyncio.create_task(worker_wrapper(image, optimize_image_task, executor)) for image in valid_images]
-
+                if num_workers == 1:
+                    optimized_results = [optimize_image_task(image) for image in valid_images]
+                else:
+                    executor = concurrent.futures.ProcessPoolExecutor(max_workers=num_workers)
+                    tasks = [
+                        asyncio.create_task(worker_wrapper(image, optimize_image_task, executor))
+                        for image in valid_images
+                    ]
                     optimized_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             except KeyboardInterrupt:
                 console.print("\n[red]CTRL+C detected. Cancelling tasks...[/red]")
-                executor.shutdown(wait=False)
                 await kill_all_child_processes()
                 console.print("[red]All tasks cancelled. Exiting.[/red]")
                 sys.exit(1)
@@ -252,9 +284,10 @@ async def disc_screenshots(meta, filename, bdinfo, folder_id, base_dir, use_vs, 
             finally:
                 if meta['debug']:
                     console.print("[yellow]Shutting down optimization workers...[/yellow]")
-                executor.shutdown(wait=False)
                 await asyncio.sleep(0.1)
                 await kill_all_child_processes()
+                if executor is not None:
+                    executor.shutdown(wait=True)
                 gc.collect()
 
             optimized_results = [res for res in optimized_results if not isinstance(res, str) or not res.startswith("Error")]
@@ -456,7 +489,12 @@ async def capture_disc_task(index, file, ss_time, image_path, keyframe, loglevel
             .global_args('-loglevel', loglevel)
         )
 
-        returncode, stdout, stderr = await run_ffmpeg(command)
+        debug_enabled = meta.get('debug', False) or meta.get('ffdebug', False)
+        returncode, stdout, stderr = await run_ffmpeg(
+            command,
+            debug=debug_enabled,
+            command_name=f"screenshot-{index}",
+        )
         if returncode == 0:
             return (index, image_path)
         else:
@@ -598,13 +636,13 @@ async def dvd_screenshots(meta, disc_num, num_screens=None, retry_cap=None):
             if meta['debug']:
                 console.print(f"[cyan]Collected frame information for {len(frame_info_results)} frames")
 
-        num_workers = min(num_screens + 1, task_limit)
+        num_workers = compute_worker_count(num_screens + 1, task_limit)
 
         if meta['debug']:
             console.print(f"Using {num_workers} worker(s) for {num_screens} image(s)")
 
         # Create semaphore to limit concurrent tasks
-        semaphore = asyncio.Semaphore(task_limit)
+        semaphore = asyncio.Semaphore(max(1, num_workers))
 
         async def capture_dvd_with_semaphore(args):
             async with semaphore:
@@ -654,7 +692,7 @@ async def dvd_screenshots(meta, disc_num, num_screens=None, retry_cap=None):
 
         # Dynamically determine the number of processes
         num_tasks = len(valid_images)
-        num_workers = min(num_tasks, task_limit)
+        num_workers = compute_worker_count(num_tasks, task_limit)
 
         if optimize_images:
             if num_workers == 0:
@@ -664,27 +702,29 @@ async def dvd_screenshots(meta, disc_num, num_screens=None, retry_cap=None):
                 console.print("[yellow]Now optimizing images...[/yellow]")
 
             loop = asyncio.get_running_loop()
-            stop_event = asyncio.Event()
+            executor: concurrent.futures.ProcessPoolExecutor | None = None
 
             def handle_sigint(sig, frame):
                 console.print("\n[red]CTRL+C detected. Cancelling optimization...[/red]")
-                executor.shutdown(wait=False)
-                stop_event.set()
+                if executor is not None:
+                    executor.shutdown(wait=False)
                 for task in asyncio.all_tasks(loop):
                     task.cancel()
 
             signal.signal(signal.SIGINT, handle_sigint)
 
             try:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                    # Start all tasks in parallel using worker_wrapper()
-                    tasks = [asyncio.create_task(worker_wrapper(image, optimize_image_task, executor)) for image in valid_images]
-
-                    # Wait for all tasks to complete
+                if num_workers == 1:
+                    optimized_results = [optimize_image_task(image) for image in valid_images]
+                else:
+                    executor = concurrent.futures.ProcessPoolExecutor(max_workers=num_workers)
+                    tasks = [
+                        asyncio.create_task(worker_wrapper(image, optimize_image_task, executor))
+                        for image in valid_images
+                    ]
                     optimized_results = await asyncio.gather(*tasks, return_exceptions=True)
             except KeyboardInterrupt:
                 console.print("\n[red]CTRL+C detected. Cancelling tasks...[/red]")
-                executor.shutdown(wait=False)
                 await kill_all_child_processes()
                 console.print("[red]All tasks cancelled. Exiting.[/red]")
                 sys.exit(1)
@@ -693,7 +733,8 @@ async def dvd_screenshots(meta, disc_num, num_screens=None, retry_cap=None):
                     console.print("[yellow]Shutting down optimization workers...[/yellow]")
                 await asyncio.sleep(0.1)
                 await kill_all_child_processes()
-                executor.shutdown(wait=False)
+                if executor is not None:
+                    executor.shutdown(wait=True)
                 gc.collect()
 
             optimized_results = [res for res in optimized_results if not isinstance(res, str) or not res.startswith("Error")]
@@ -703,7 +744,6 @@ async def dvd_screenshots(meta, disc_num, num_screens=None, retry_cap=None):
             if not retry_cap and meta['debug']:
                 console.print(f"[green]Successfully optimized {len(optimized_results)} images.")
 
-            executor.shutdown(wait=True)  # Ensure cleanup
         else:
             optimized_results = valid_images
 
@@ -862,7 +902,11 @@ async def capture_dvd_screenshot(task):
             # Use the filtered output with frame info
             ff = base_text
 
-        returncode, _, stderr = await run_ffmpeg(ff.output(image, vframes=1, pix_fmt="rgb24").overwrite_output().global_args('-loglevel', loglevel, '-accurate_seek'))
+        returncode, _, stderr = await run_ffmpeg(
+            ff.output(image, vframes=1, pix_fmt="rgb24").overwrite_output().global_args('-loglevel', loglevel, '-accurate_seek'),
+            debug=meta.get('debug', False) or meta.get('ffdebug', False),
+            command_name=f"dvd-screenshot-{index}",
+        )
         if returncode != 0:
             console.print(f"[red]Error capturing screenshot for {input_file} at {seek_time}s:[/red]\n{stderr.decode()}")
             return (index, None)
@@ -1012,7 +1056,7 @@ async def screenshots(path, filename, folder_id, base_dir, meta, num_screens=Non
             console.print(f"[cyan]Collected frame information for {len(frame_info_results)} frames")
 
     num_tasks = num_capture
-    num_workers = min(num_tasks, task_limit)
+    num_workers = compute_worker_count(num_tasks, task_limit)
 
     meta['libplacebo'] = False
     if tone_map and ("HDR" in meta['hdr'] or "DV" in meta['hdr'] or "HLG" in meta['hdr']):
@@ -1055,7 +1099,7 @@ async def screenshots(path, filename, folder_id, base_dir, meta, num_screens=Non
         console.print(f"Using {num_workers} worker(s) for {num_capture} image(s)")
 
     # Create semaphore to limit concurrent tasks
-    semaphore = asyncio.Semaphore(num_workers)
+    semaphore = asyncio.Semaphore(max(1, num_workers))
 
     async def capture_with_semaphore(args):
         async with semaphore:
@@ -1109,24 +1153,36 @@ async def screenshots(path, filename, folder_id, base_dir, meta, num_screens=Non
 
     optimized_results = []
     valid_images = [image for image in capture_results if os.path.exists(image)]
-    num_workers = min(task_limit, len(valid_images))
+    num_workers = compute_worker_count(len(valid_images), task_limit)
     if optimize_images:
+        if num_workers == 0:
+            console.print("[red]No valid images found for optimization.[/red]")
+            return capture_results
+
         if meta['debug']:
             console.print("[yellow]Now optimizing images...[/yellow]")
             console.print(f"Using {num_workers} worker(s) for {len(valid_images)} image(s)")
 
-        executor = concurrent.futures.ProcessPoolExecutor(max_workers=num_workers)
+        executor: concurrent.futures.ProcessPoolExecutor | None = None
+        tasks: list[asyncio.Task] = []
         try:
-            with executor:
+            if num_workers == 1:
+                optimized_results = [optimize_image_task(image) for image in valid_images]
+            else:
+                executor = concurrent.futures.ProcessPoolExecutor(max_workers=num_workers)
                 # Start all tasks in parallel using worker_wrapper()
-                tasks = [asyncio.create_task(worker_wrapper(image, optimize_image_task, executor)) for image in valid_images]
+                tasks = [
+                    asyncio.create_task(worker_wrapper(image, optimize_image_task, executor))
+                    for image in valid_images
+                ]
 
                 # Wait for all tasks to complete
                 optimized_results = await asyncio.gather(*tasks, return_exceptions=True)
         except KeyboardInterrupt:
             console.print("\n[red]CTRL+C detected. Cancelling optimization tasks...[/red]")
             await asyncio.sleep(0.1)
-            executor.shutdown(wait=True, cancel_futures=True)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
             await kill_all_child_processes()
             console.print("[red]All tasks cancelled. Exiting.[/red]")
             gc.collect()
@@ -1135,7 +1191,8 @@ async def screenshots(path, filename, folder_id, base_dir, meta, num_screens=Non
         except Exception as e:
             console.print(f"[red]Error during image optimization: {e}[/red]")
             await asyncio.sleep(0.1)
-            executor.shutdown(wait=True, cancel_futures=True)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
             await kill_all_child_processes()
             gc.collect()
             reset_terminal()
@@ -1144,7 +1201,8 @@ async def screenshots(path, filename, folder_id, base_dir, meta, num_screens=Non
             if meta['debug']:
                 console.print("[yellow]Shutting down optimization workers...[/yellow]")
             await asyncio.sleep(0.1)
-            executor.shutdown(wait=True, cancel_futures=True)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
             for task in tasks:
                 task.cancel()
             await kill_all_child_processes()
@@ -1410,7 +1468,7 @@ async def capture_screenshot(args):
 
             def build_cmd(use_libplacebo=True):
                 cmd_local = [
-                    "ffmpeg",
+                    FFMPEG_BINARY,
                     "-ss", str(ss_time),
                     "-i", path,
                     "-map", "0:v:0",
@@ -1429,13 +1487,16 @@ async def capture_screenshot(args):
                 if ffmpeg_limit:
                     cmd_local += ["-threads", threads_val]
                 cmd_local.append(image_path)
-                return cmd_local
+                return prepare_ffmpeg_command(cmd_local)
 
             cmd = build_cmd(use_libplacebo=True)
 
             if loglevel == 'verbose' or (meta and meta.get('debug', False)):
                 # Disable emoji translation so 0:v:0 stays literal
-                console.print(f"[cyan]FFmpeg command: {' '.join(cmd)}[/cyan]", emoji=False)
+                console.print(
+                    f"[cyan]FFmpeg command: {format_command_for_logging(cmd)}[/cyan]",
+                    emoji=False,
+                )
 
             # --- Execute with retry/fallback if libplacebo fails ---
             async def run_cmd(run_cmd_list, timeout_sec):
@@ -1609,18 +1670,31 @@ async def capture_screenshot(args):
 
         # Print the command for debugging
         if loglevel == 'verbose' or (meta and meta.get('debug', False)):
-            cmd = command.compile()
-            console.print(f"[cyan]FFmpeg command: {' '.join(cmd)}[/cyan]")
+            cmd = prepare_ffmpeg_object(command)
+            console.print(
+                f"[cyan]FFmpeg command: {format_command_for_logging(cmd)}[/cyan]",
+                emoji=False,
+            )
 
         try:
-            returncode, stdout, stderr = await run_ffmpeg(command)
+            returncode, stdout, stderr = await run_ffmpeg(
+                command,
+                debug=meta.get('debug', False) or meta.get('ffdebug', False),
+                command_name=f"capture-{index}",
+            )
 
             # Print stdout and stderr if in verbose mode
             if loglevel == 'verbose':
                 if stdout:
-                    console.print(f"[blue]FFmpeg stdout:[/blue]\n{stdout.decode('utf-8', errors='replace')}")
+                    console.print(
+                        f"[blue]FFmpeg stdout:[/blue]\n{stdout.decode('utf-8', errors='replace')}",
+                        emoji=False,
+                    )
                 if stderr:
-                    console.print(f"[yellow]FFmpeg stderr:[/yellow]\n{stderr.decode('utf-8', errors='replace')}")
+                    console.print(
+                        f"[yellow]FFmpeg stderr:[/yellow]\n{stderr.decode('utf-8', errors='replace')}",
+                        emoji=False,
+                    )
 
         except asyncio.CancelledError:
             console.print(traceback.format_exc())
@@ -1772,11 +1846,18 @@ async def get_frame_info(path, ss_time, meta):
         )
 
         # Print the actual FFmpeg command for debugging
-        cmd = info_command.compile()
+        cmd = prepare_ffmpeg_object(info_command)
         if meta.get('debug', False):
-            console.print(f"[cyan]FFmpeg showinfo command: {' '.join(cmd)}[/cyan]")
+            console.print(
+                f"[cyan]FFmpeg showinfo command: {format_command_for_logging(cmd)}[/cyan]",
+                emoji=False,
+            )
 
-        returncode, _, stderr = await run_ffmpeg(info_command)
+        returncode, _, stderr = await run_ffmpeg(
+            info_command,
+            debug=meta.get('debug', False) or meta.get('ffdebug', False),
+            command_name="showinfo",
+        )
         assert returncode is not None
         stderr_text = stderr.decode('utf-8', errors='replace')
 
@@ -1836,7 +1917,7 @@ async def check_libplacebo_compatibility(w_sar, h_sar, width, height, path, ss_t
             filter_parts.append(f"{input_label}libplacebo=tonemapping=auto:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv[out]")
             output_map = "[out]"
             cmd = [
-                "ffmpeg",
+                FFMPEG_BINARY,
                 "-init_hw_device", "vulkan",
                 "-ss", str(ss_time),
                 "-i", path,
@@ -1852,7 +1933,7 @@ async def check_libplacebo_compatibility(w_sar, h_sar, width, height, path, ss_t
             # Use -vf for zscale/tonemap chain, no output label or -map needed
             vf_chain = f"zscale=transfer=linear,tonemap=tonemap={algorithm}:desat={desat},zscale=transfer=bt709,format=rgb24"
             cmd = [
-                "ffmpeg",
+                FFMPEG_BINARY,
                 "-ss", str(ss_time),
                 "-i", path,
                 "-vf", vf_chain,
@@ -1863,8 +1944,13 @@ async def check_libplacebo_compatibility(w_sar, h_sar, width, height, path, ss_t
                 test_image_path
             ]
 
+        cmd = prepare_ffmpeg_command(cmd)
+
         if loglevel == 'verbose' or (meta and meta.get('debug', False)):
-            console.print(f"[cyan]libplacebo compatibility test command: {' '.join(cmd)}[/cyan]")
+            console.print(
+                f"[cyan]libplacebo compatibility test command: {format_command_for_logging(cmd)}[/cyan]",
+                emoji=False,
+            )
 
         # Add timeout to prevent hanging
         process = await asyncio.create_subprocess_exec(
@@ -1921,7 +2007,7 @@ async def libplacebo_warmup(path, meta, loglevel):
         return
     # Use a very small seek (0.1s) to avoid issues at pts 0
     cmd = [
-        "ffmpeg",
+        FFMPEG_BINARY,
         "-ss", "0.1",
         "-i", path,
         "-map", "0:v:0",
@@ -1933,6 +2019,7 @@ async def libplacebo_warmup(path, meta, loglevel):
         "-",
         "-loglevel", "error"
     ]
+    cmd = prepare_ffmpeg_command(cmd)
     if loglevel == 'verbose' or meta.get('debug', False):
         console.print("[cyan]Running libplacebo warm-up...[/cyan]", emoji=False)
     try:
