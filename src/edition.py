@@ -296,7 +296,7 @@ async def get_edition(video, bdinfo, filelist, manual_edition, meta):
     # Handle repack info
     def _select_variant(prefix, extra_tokens=None):
         prefix = prefix.upper()
-        pattern = rf"\\b{prefix}\\d*\\b"
+        pattern = rf"\b{re.escape(prefix)}\d*\b"
         combined_text = f"{video.upper()} {edition.upper()}"
         matches = re.findall(pattern, combined_text)
         if extra_tokens:
