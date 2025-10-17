@@ -200,7 +200,7 @@ async def get_edition(video, bdinfo, filelist, manual_edition, meta):
                         # If just one edition matches, add it directly
                         elif len(matching_editions) == 1:
                             edition_info = matching_editions[0]
-                            console.print(f"[green]Playlist {playlist_edition} matches edition: {edition_info['display_name']} {edition_name}[/green]")
+                            console.print(f"[green]Playlist {playlist_edition} matches edition: {edition_info['display_name']} {edition_info['name']}[/green]")
 
                             if edition_info['has_attributes']:
                                 if edition_info['name'] not in matched_editions_with_attributes:
@@ -294,25 +294,44 @@ async def get_edition(video, bdinfo, filelist, manual_edition, meta):
     edition = edition.replace(",", " ")
 
     # Handle repack info
+    def _select_variant(prefix, extra_tokens=None):
+        prefix = prefix.upper()
+        pattern = rf"\b{re.escape(prefix)}\d*\b"
+        combined_text = f"{video.upper()} {edition.upper()}"
+        matches = re.findall(pattern, combined_text)
+        if extra_tokens:
+            matches.extend(token.upper() for token in extra_tokens)
+        if not matches:
+            return ""
+
+        def _variant_key(token):
+            suffix = token[len(prefix):]
+            return int(suffix) if suffix.isdigit() else 0
+
+        return max(matches, key=_variant_key)
+
     repack = ""
-    if "REPACK" in (video.upper() or edition.upper()) or "V2" in video:
-        repack = "REPACK"
-    if "REPACK2" in (video.upper() or edition.upper()) or "V3" in video:
-        repack = "REPACK2"
-    if "REPACK3" in (video.upper() or edition.upper()) or "V4" in video:
-        repack = "REPACK3"
-    if "PROPER" in (video.upper() or edition.upper()):
-        repack = "PROPER"
-    if "PROPER2" in (video.upper() or edition.upper()):
-        repack = "PROPER2"
-    if "PROPER3" in (video.upper() or edition.upper()):
-        repack = "PROPER3"
-    if "RERIP" in (video.upper() or edition.upper()):
-        repack = "RERIP"
+    v_matches = [int(num) for num in re.findall(r"\bV(\d+)\b", video.upper())]
+    repack_tokens = []
+    if v_matches:
+        max_v = max(v_matches)
+        if max_v >= 2:
+            suffix = max_v - 1
+            repack_tokens.append(f"REPACK{suffix}" if suffix > 1 else "REPACK")
+
+    repack = _select_variant("REPACK", extra_tokens=repack_tokens) or \
+        _select_variant("PROPER") or \
+        _select_variant("RERIP")
+
+    cleanup_pattern = r"(\bREPACK\d*\b|\bRERIP\d*\b|\bPROPER\d*\b)"
+
+    manual_tokens = set()
+    if manual_edition:
+        manual_tokens = set(re.findall(cleanup_pattern, str(manual_edition), flags=re.IGNORECASE))
 
     # Only remove REPACK, RERIP, or PROPER from edition if not in manual edition
-    if not manual_edition or all(tag.lower() not in ['repack', 'repack2', 'repack3', 'proper', 'proper2', 'proper3', 'rerip'] for tag in manual_edition.strip().lower().split()):
-        edition = re.sub(r"(\bREPACK\d?\b|\bRERIP\b|\bPROPER\b)", "", edition, flags=re.IGNORECASE).strip()
+    if not manual_edition or not manual_tokens:
+        edition = re.sub(cleanup_pattern, "", edition, flags=re.IGNORECASE).strip()
 
     if not meta.get('webdv', False):
         hybrid = False
