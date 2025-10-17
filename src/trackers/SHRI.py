@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from typing import Literal
 import cli_ui
 import os
 import pycountry
@@ -69,6 +70,8 @@ class SHRI(UNIT3D):
         year = str(meta.get("year", ""))
         resolution = meta.get("resolution", "")
         source = meta.get("source", "")
+        if isinstance(source, list):
+            source = source[0] if source else ""
         video_codec = meta.get("video_codec", "")
         video_encode = meta.get("video_encode", "")
 
@@ -131,11 +134,14 @@ class SHRI(UNIT3D):
 
         # Detect Hybrid from filename if not in title
         hybrid = ""
-        if meta.get("webdv", False) and "HYBRID" not in title.upper():
+        if (
+            meta.get("webdv", False) or isinstance(meta.get("source", ""), list)
+        ) and "HYBRID" not in title.upper():
             hybrid = "Hybrid"
 
         repack = meta.get("repack", "").strip()
 
+        name = None
         # Build name per ShareIsland type-specific format
         if effective_type == "DISC":
             # Inject region from validated session data if available
@@ -237,10 +243,9 @@ class SHRI(UNIT3D):
 
         return {"name": name}
 
-    async def get_type_id(self, meta):
+    async def get_type_id(self, meta, type=None, reverse=False, mapping_only=False):
         """Map release type to ShareIsland type IDs"""
-        effective_type = self._get_effective_type(meta)
-        type_id = {
+        type_mapping = {
             "CINEMA_NEWS": "42",
             "DISC": "26",
             "REMUX": "7",
@@ -250,10 +255,21 @@ class SHRI(UNIT3D):
             "ENCODE": "15",
             "DVDRIP": "15",
             "BRRIP": "15",
-        }.get(effective_type, "0")
-        return {"type_id": type_id}
+        }
 
-    async def get_additional_checks(self, meta):
+        if mapping_only:
+            return type_mapping
+
+        elif reverse:
+            return {v: k for k, v in type_mapping.items()}
+        elif type is not None:
+            return {"type_id": type_mapping.get(type, "0")}
+        else:
+            effective_type = self._get_effective_type(meta)
+            type_id = type_mapping.get(effective_type, "0")
+            return {"type_id": type_id}
+
+    async def get_additional_checks(self, meta) -> Literal[True]:
         """
         Validate and prompt for DVD/HDDVD region/distributor before upload.
         Stores validated IDs in module-level dict keyed by UUID for use during upload.
@@ -278,16 +294,17 @@ class SHRI(UNIT3D):
             # Validate region name was provided
             if not region_name:
                 cli_ui.error("Region required; skipping SHRI.")
-                return False
+                raise ValueError("Region required for disc upload")
 
             # Validate region code with API
             region_id = await self.common.unit3d_region_ids(region_name)
             if not region_id:
                 cli_ui.error(f"Invalid region code '{region_name}'; skipping SHRI.")
-                return False
+                raise ValueError(f"Invalid region code: {region_name}")
 
             # Handle optional distributor
             distributor_name = meta.get("distributor")
+            distributor_id = None
             if not distributor_name and not meta.get("unattended"):
                 distributor_name = cli_ui.ask_string(
                     "SHRI: Distributor (optional, Enter to skip): "
@@ -356,19 +373,36 @@ class SHRI(UNIT3D):
         """Distinguish REMUX/WEBDL/WEBRIP/ENCODE via MediaInfo"""
         try:
             mi = meta.get("mediainfo", {})
-            video_track = mi.get("media", {}).get("track", [{}])[1]
-            source = meta.get("source", "").upper()
-            # Has encode settings = definitely encoded
-            if video_track.get("Encoded_Library_Settings"):
-                return "WEBRIP" if "WEB" in source else "ENCODE"
+            tracks = mi.get("media", {}).get("track", [])
+            general_track = tracks[0]
+            video_track = tracks[1]
+            source = meta.get("source", "")
+            if isinstance(source, list):
+                source = [s.upper() for s in source]
+            else:
+                source = [source.upper()] if source else []
+            # Check video track encode settings
+            has_video_encoding = video_track.get(
+                "Encoded_Library_Settings"
+            ) and not isinstance(video_track.get("Encoded_Library_Settings"), dict)
+            # Check general track for tools (including extra field)
+            encoded_app = str(general_track.get("Encoded_Application", "")).lower()
+            extra = general_track.get("extra", {})
+            writing_frontend = str(extra.get("Writing_frontend", "")).lower()
+            tool_string = f"{encoded_app} {writing_frontend}"
+            encoding_tools = ["handbrake", "x264", "x265", "ffmpeg -c:v", "staxrip"]
+            has_encoding_app = any(tool in tool_string for tool in encoding_tools)
+            # If ANY encoding detected = definitely encoded
+            if has_video_encoding or has_encoding_app:
+                return "WEBRIP" if any("WEB" in s for s in source) else "ENCODE"
             # Profile 8 = streaming-only
             if "dvhe.08" in video_track.get("HDR_Format_Profile", ""):
                 return "WEBDL"
             # No encode settings + WEB source = WEB-DL
-            if "WEB" in source:
+            if any("WEB" in s for s in source):
                 return "WEBDL"
             # No encode settings + disc source = REMUX
-            if source in ("BLURAY", "HDDVD"):
+            if any(s in ("BLURAY", "BLU-RAY", "HDDVD") for s in source):
                 return "REMUX"
         except (IndexError, KeyError):
             pass
@@ -386,7 +420,9 @@ class SHRI(UNIT3D):
         if self.CINEMA_NEWS_PATTERN.search(basename):
             return "CINEMA_NEWS"
 
-        return self._detect_type_from_technical_analysis(meta)
+        detected_type = self._detect_type_from_technical_analysis(meta)
+        cli_ui.info(f"{self.tracker} Detected type: {detected_type}")
+        return detected_type
 
     def _get_italian_title(self, imdb_info):
         """Extract Italian title from IMDb AKAs with priority"""
