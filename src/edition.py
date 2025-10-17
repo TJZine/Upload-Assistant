@@ -200,7 +200,7 @@ async def get_edition(video, bdinfo, filelist, manual_edition, meta):
                         # If just one edition matches, add it directly
                         elif len(matching_editions) == 1:
                             edition_info = matching_editions[0]
-                            console.print(f"[green]Playlist {playlist_edition} matches edition: {edition_info['display_name']} {edition_name}[/green]")
+                            console.print(f"[green]Playlist {playlist_edition} matches edition: {edition_info['display_name']} {edition_info['name']}[/green]")
 
                             if edition_info['has_attributes']:
                                 if edition_info['name'] not in matched_editions_with_attributes:
