@@ -102,6 +102,7 @@ class Prep():
         meta['we_asked_tvmaze'] = False
         meta['audio_languages'] = None
         meta['subtitle_languages'] = None
+        meta['aither_trumpable'] = None
 
         folder_id = os.path.basename(meta['path'])
         if meta.get('uuid', None) is None:
@@ -112,7 +113,10 @@ class Prep():
         if meta['debug']:
             console.print(f"[cyan]ID: {meta['uuid']}")
 
-        meta['is_disc'], videoloc, bdinfo, meta['discs'] = await get_disc(meta)
+        try:
+            meta['is_disc'], videoloc, bdinfo, meta['discs'] = await get_disc(meta)
+        except Exception:
+            raise
 
         # Debugging information
         # console.print(f"Debug: meta['filelist'] before population: {meta.get('filelist', 'Not Set')}")
@@ -403,6 +407,22 @@ class Prep():
         if meta['debug']:
             pathed_time_start = time.time()
 
+        if not meta.get('emby') and meta.get('trackers'):
+            trackers = meta['trackers']
+        else:
+            default_trackers = config['TRACKERS'].get('default_trackers', '')
+            trackers = [tracker.strip() for tracker in default_trackers.split(',')]
+
+        if isinstance(trackers, str):
+            if "," in trackers:
+                trackers = [t.strip().upper() for t in trackers.split(',')]
+            else:
+                trackers = [trackers.strip().upper()]  # Make it a list with one element
+        else:
+            trackers = [t.strip().upper() for t in trackers]
+        meta['trackers'] = trackers
+        meta['requested_trackers'] = trackers
+
         # auto torrent searching with qbittorrent that grabs torrent ids for metadata searching
         if not any(meta.get(id_type) for id_type in hash_ids + tracker_ids) and not meta.get('skip_trackers', False) and not meta.get('edit', False):
             await client.get_pathed_torrents(meta['path'], meta)
@@ -516,12 +536,9 @@ class Prep():
             if meta.get('infohash') is not None and not meta['base_torrent_created'] and not meta['we_checked_them_all'] and not ids:
                 meta = await client.get_ptp_from_hash(meta)
 
-            meta['skip_this_content'] = False
-            if (meta.get('site_check', False) and not meta.get('edit', False)) or (not meta.get('edit', False) and not ids):
+            if not meta.get('edit', False) and not ids:
                 # Reuse information from trackers with fallback
                 await get_tracker_data(video, meta, search_term, search_file_folder, meta['category'], only_id=only_id)
-                if meta.get('skip_this_content', False):
-                    raise Exception()
 
             if meta.get('category', None) == "TV" and use_sonarr and meta.get('tvdb_id', 0) != 0 and ids is None and not meta.get('matched_tracker', None):
                 ids = await get_sonarr_data(tvdb_id=meta.get('tvdb_id', 0), debug=meta.get('debug', False))
@@ -567,7 +584,7 @@ class Prep():
 
         # if there's no region/distributor info, lets ping some unit3d trackers and see if we get it
         ping_unit3d_config = self.config['DEFAULT'].get('ping_unit3d', False)
-        if (not meta.get('region') or not meta.get('distributor')) and meta['is_disc'] == "BDMV" and ping_unit3d_config and not meta.get('edit', False) and not meta.get('emby', False):
+        if (not meta.get('region') or not meta.get('distributor')) and meta['is_disc'] == "BDMV" and ping_unit3d_config and not meta.get('edit', False) and not meta.get('emby', False) and not meta.get('site_check', False):
             await ping_unit3d(meta)
 
         # the first user override check that allows to set metadata ids.
@@ -858,7 +875,7 @@ class Prep():
         meta['bluray_score'] = int(float(self.config['DEFAULT'].get('bluray_score', 100)))
         meta['bluray_single_score'] = int(float(self.config['DEFAULT'].get('bluray_single_score', 100)))
         meta['use_bluray_images'] = self.config['DEFAULT'].get('use_bluray_images', False)
-        if meta.get('is_disc') in ("BDMV", "DVD") and get_bluray_info and (meta.get('distributor') is None or meta.get('region') is None) and meta.get('imdb_id') != 0 and not meta.get('emby', False):
+        if meta.get('is_disc') in ("BDMV", "DVD") and get_bluray_info and (meta.get('distributor') is None or meta.get('region') is None) and meta.get('imdb_id') != 0 and not meta.get('emby', False) and not meta.get('edit', False) and not meta.get('site_check', False):
             await get_bluray_releases(meta)
 
             # and if we getting bluray/dvd images, we'll rehost them
@@ -971,6 +988,26 @@ class Prep():
             elif meta.get('service'):
                 services = await get_service(get_services_only=True)
                 meta['service_longname'] = max((k for k, v in services.items() if v == meta['service']), key=len, default=meta['service'])
+
+            # Combine genres from TMDB and IMDb
+            tmdb_genres = meta.get('genres', '') or ''
+            imdb_genres = meta.get('imdb_info', {}).get('genres', '') or ''
+
+            all_genres = []
+            if tmdb_genres:
+                all_genres.extend([g.strip() for g in tmdb_genres.split(',') if g.strip()])
+            if imdb_genres:
+                all_genres.extend([g.strip() for g in imdb_genres.split(',') if g.strip()])
+
+            seen = set()
+            unique_genres = []
+            for genre in all_genres:
+                genre_lower = genre.lower()
+                if genre_lower not in seen:
+                    seen.add(genre_lower)
+                    unique_genres.append(genre)
+
+            meta['combined_genres'] = ', '.join(unique_genres) if unique_genres else ''
 
         # return duplicate ids so I don't have to catch every site file
         # this has the other advantage of stringing imdb for this object
