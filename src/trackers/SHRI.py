@@ -90,7 +90,7 @@ class SHRI(UNIT3D):
         # Clean audio: remove Dual-Audio and trailing language codes
         audio = await self._get_best_italian_audio_format(meta)
 
-        # Build audio language tag: original → ITALIAN → ENGLISH → others/Multi (4+)
+        # Build audio language tag: original -> ITALIAN -> ENGLISH -> others/Multi (4+)
         audio_lang_str = ""
         if meta.get("audio_languages"):
             # Normalize all to full names
@@ -122,7 +122,7 @@ class SHRI(UNIT3D):
                 result.append("ENGLISH")
                 remaining.remove("ENGLISH")
 
-            # Handle remaining: show individually if ≤3 total, else add Multi
+            # Handle remaining: show individually if <=3 total, else add Multi
             if len(result) + len(remaining) > 3:
                 result.append("Multi")
             else:
@@ -138,8 +138,10 @@ class SHRI(UNIT3D):
         # Detect Hybrid from filename if not in title
         hybrid = ""
         if (
-            meta.get("webdv", False) or isinstance(meta.get("source", ""), list)
-        ) and "HYBRID" not in title.upper():
+            not edition
+            and (meta.get("webdv", False) or isinstance(meta.get("source", ""), list))
+            and "HYBRID" not in title.upper()
+        ):
             hybrid = "Hybrid"
 
         repack = meta.get("repack", "").strip()
@@ -202,49 +204,78 @@ class SHRI(UNIT3D):
             # Fallback: use original name with cleaned audio
             name = meta["name"].replace("Dual-Audio", "").strip()
 
+        # Ensure name is always a string
+        if not name:
+            name = meta.get("name", "UNKNOWN")
+
         # Add [SUBS] for Italian subtitles without Italian audio
         if not self._has_italian_audio(meta) and self._has_italian_subtitles(meta):
             name = f"{name} [SUBS]"
 
-        # Extract and clean release group tag
-        tag = meta.get("tag", "").strip()
-        if not tag:
-            basename = self.get_basename(meta)
-
-            # Get extension from mediainfo and remove it
-            ext = (
-                meta.get("mediainfo", {})
-                .get("media", {})
-                .get("track", [{}])[0]
-                .get("FileExtension", "")
-            )
-            name_no_ext = (
-                basename[: -len(ext) - 1]
-                if ext and basename.endswith(f".{ext}")
-                else basename
-            )
-
-            # Extract tag after last hyphen
-            if "-" in name_no_ext:
-                potential_tag = name_no_ext.split("-")[-1]
-                if (
-                    potential_tag
-                    and len(potential_tag) <= 30
-                    and potential_tag.replace("_", "").replace(".", "").isalnum()
-                ):
-                    tag = potential_tag
-
-        # Clean and validate tag
-        tag = tag.lstrip("-").strip()
-        tag = re.sub(r"^[A-Z]{2,3}\s+", "", tag)
-
-        if not tag or self.INVALID_TAG_PATTERN.search(tag):
-            tag = "NoGroup"
-
-        name = f"{name}-{tag}"
+        # Cleanup whitespace
         name = self.WHITESPACE_PATTERN.sub(" ", name).strip()
 
+        # Extract tag and append if valid
+        tag = self._extract_clean_release_group(meta, name)
+        if tag:
+            name = f"{name}-{tag}"
+
         return {"name": name}
+
+    def _extract_clean_release_group(self, meta, current_name):
+        """Extract release group if not already in the calculated name"""
+        tag = meta.get("tag", "").strip().lstrip("-")
+        if tag and " " not in tag and not self.INVALID_TAG_PATTERN.search(tag):
+            return tag
+
+        basename = self.get_basename(meta)
+        # Get extension from mediainfo and remove it
+        ext = (
+            meta.get("mediainfo", {})
+            .get("media", {})
+            .get("track", [{}])[0]
+            .get("FileExtension", "")
+        )
+        name_no_ext = (
+            basename[: -len(ext) - 1]
+            if ext and basename.endswith(f".{ext}")
+            else basename
+        )
+        parts = re.split(r"[-.]", name_no_ext)
+        if not parts:
+            return "NoGroup"
+
+        potential_tag = parts[-1].strip()
+        # Handle space-separated components
+        if " " in potential_tag:
+            potential_tag = potential_tag.split()[-1]
+
+        if (
+            not potential_tag
+            or len(potential_tag) > 30
+            or not potential_tag.replace("_", "").isalnum()
+            or self.INVALID_TAG_PATTERN.search(potential_tag)
+        ):
+            return "NoGroup"
+
+        # Special case: UNTOUCHED/VU at end is valid tag, don't reject
+        if self.MARKER_PATTERN.search(potential_tag):
+            return potential_tag
+
+        # Check against calculated name
+        name_normalized = (
+            current_name.lower()
+            .replace("-", "")
+            .replace(".", "")
+            .replace(" ", "")
+            .replace("_", "")
+        )
+        tag_normalized = potential_tag.lower().replace("_", "")
+
+        if tag_normalized in name_normalized:
+            return "NoGroup"
+
+        return potential_tag
 
     async def get_type_id(self, meta, type=None, reverse=False, mapping_only=False):
         """Map release type to ShareIsland type IDs"""
@@ -373,43 +404,138 @@ class SHRI(UNIT3D):
         return False
 
     def _analyze_encode_type(self, meta):
-        """Distinguish REMUX/WEBDL/WEBRIP/ENCODE via MediaInfo"""
+        """
+        Detect release type from MediaInfo technical analysis.
+
+        Priority order:
+        1. DV profile (05/07/08) + no encoding -> WEB-DL (overrides source field)
+        2. CRF in settings -> WEBRIP/ENCODE
+        3. Service fingerprints -> WEB-DL (CR/Netflix patterns)
+        4. BluRay encoding detection -> ENCODE (settings, library, or GPU stripped metadata)
+        5. Encoding tools (source-aware) -> WEBRIP/ENCODE (Handbrake/Staxrip/etc in general track)
+        6. No encoding + WEB -> WEB-DL
+        7. Service override -> WEB-DL (handles misdetected sources)
+        8. No encoding + disc -> REMUX
+        """
+
+        def has_encoding_tools(general_track, tools):
+            """Check if general track contains specified encoding tools."""
+            encoded_app = str(general_track.get("Encoded_Application", "")).lower()
+            extra = general_track.get("extra", {})
+            writing_frontend = str(extra.get("Writing_frontend", "")).lower()
+            tool_string = f"{encoded_app} {writing_frontend}"
+            return any(tool in tool_string for tool in tools)
+
         try:
             mi = meta.get("mediainfo", {})
             tracks = mi.get("media", {}).get("track", [])
             general_track = tracks[0]
             video_track = tracks[1]
+
+            # Normalize source list
             source = meta.get("source", "")
             if isinstance(source, list):
                 source = [s.upper() for s in source]
             else:
                 source = [source.upper()] if source else []
-            # Check video track encode settings
-            has_video_encoding = video_track.get(
-                "Encoded_Library_Settings"
-            ) and not isinstance(video_track.get("Encoded_Library_Settings"), dict)
-            # Check general track for tools (including extra field)
-            encoded_app = str(general_track.get("Encoded_Application", "")).lower()
-            extra = general_track.get("extra", {})
-            writing_frontend = str(extra.get("Writing_frontend", "")).lower()
-            tool_string = f"{encoded_app} {writing_frontend}"
-            encoding_tools = ["handbrake", "x264", "x265", "ffmpeg -c:v", "staxrip"]
-            has_encoding_app = any(tool in tool_string for tool in encoding_tools)
-            # If ANY encoding detected = definitely encoded
-            if has_video_encoding or has_encoding_app:
+
+            service = str(meta.get("service", "")).upper()
+
+            # Extract encoding metadata
+            raw_settings = video_track.get("Encoded_Library_Settings", "")
+            raw_library = video_track.get("Encoded_Library", "")
+            has_settings = raw_settings and not isinstance(raw_settings, dict)
+            has_library = raw_library and not isinstance(raw_library, dict)
+            encoding_settings = str(raw_settings).lower() if has_settings else ""
+            encoded_library = str(raw_library).lower() if has_library else ""
+
+            # ===== Priority 1: DV streaming profiles =====
+            # DV profiles 5/7/8 indicate streaming sources (overrides source field)
+            hdr_profile = video_track.get("HDR_Format_Profile", "")
+            has_streaming_dv = any(
+                prof in hdr_profile for prof in ["dvhe.05", "dvhe.07", "dvhe.08"]
+            )
+
+            if has_streaming_dv and not encoding_settings:
+                # Ensure not re-encoded by user tools
+                if not has_encoding_tools(
+                    general_track, ["handbrake", "staxrip", "megatagger"]
+                ):
+                    return "WEBDL"
+
+            # ===== Priority 2: CRF detection =====
+            # CRF (Constant Rate Factor) indicates user re-encode
+            if "crf=" in encoding_settings:
                 return "WEBRIP" if any("WEB" in s for s in source) else "ENCODE"
-            # Profile 8 = streaming-only
-            if "dvhe.08" in video_track.get("HDR_Format_Profile", ""):
-                return "WEBDL"
-            # No encode settings + WEB source = WEB-DL
+
+            # ===== Priority 3: Service fingerprints =====
+            # Crunchyroll detection
+            if service == "CR":
+                if "core 142" in encoded_library:
+                    return "WEBDL"
+                if has_library:
+                    core_match = re.search(r"core (\d+)", encoded_library)
+                    if core_match and int(core_match.group(1)) >= 152:
+                        return "WEBRIP"
+                if encoding_settings and "bitrate=" in encoding_settings:
+                    return "WEBDL"
+
+            # Netflix fingerprint detection
+            format_profile = video_track.get("Format_Profile", "")
+            if "Main@L4.0" in format_profile and "rc=2pass" in encoding_settings:
+                if "core 118" in encoded_library or "core 148" in encoded_library:
+                    return "WEBDL"
+
+            # ===== Priority 4: BluRay encoding detection =====
+            if any(s in ("BLURAY", "BLU-RAY") for s in source):
+                # GPU encode detection: empty BitDepth/Chroma metadata (dict type)
+                if isinstance(video_track.get("BitDepth"), dict):
+                    return "ENCODE"
+                # Any encoding settings or library info = encode (not remux)
+                # Catches x264/x265 in Encoded_Library or settings in Encoded_Library_Settings
+                if has_settings or has_library:
+                    return "ENCODE"
+
+            # ===== Priority 5: Encoding tools (source-aware) =====
+            # Check general track for encoding tools (Handbrake, Staxrip, etc)
+            if any(s in ("BLURAY", "BLU-RAY") for s in source):
+                if has_encoding_tools(
+                    general_track,
+                    ["x264", "x265", "handbrake", "staxrip", "megatagger"],
+                ):
+                    return "ENCODE"
+
+            # WEB sources: only explicit user tools indicate re-encode
+            if any("WEB" in s for s in source):
+                if has_encoding_tools(
+                    general_track, ["handbrake", "staxrip", "megatagger"]
+                ):
+                    return "WEBRIP"
+
+            # ===== Priority 6: No encoding + WEB = WEB-DL =====
             if any("WEB" in s for s in source):
                 return "WEBDL"
-            # No encode settings + disc source = REMUX
+
+            # ===== Priority 7: Service override =====
+            # If streaming service is set but source wasn't detected as Web,
+            # override to WEB-DL (handles upstream get_source.py misdetection)
+            if service and service not in ("", "NONE"):
+                return "WEBDL"
+
+            # ===== Priority 8: No encoding + disc = REMUX =====
             if any(s in ("BLURAY", "BLU-RAY", "HDDVD") for s in source):
                 return "REMUX"
+
+            # DVD REMUX detection
+            if any(s in ("NTSC", "PAL", "NTSC DVD", "PAL DVD", "DVD") for s in source):
+                if not has_settings and not has_library:
+                    return "REMUX"
+
         except (IndexError, KeyError):
+            # Fallback on mediainfo parsing errors
             pass
 
+        # Final fallback: use meta type or default to ENCODE
         return meta.get("type", "ENCODE")
 
     def _get_effective_type(self, meta):

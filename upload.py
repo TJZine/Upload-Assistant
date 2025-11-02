@@ -126,6 +126,44 @@ def update_oeimg_to_onlyimage():
         console.print("[yellow]No 'oeimg' or 'oeimg_api' found to update in config.py[/yellow]")
 
 
+async def validate_tracker_logins(meta, trackers=None):
+    if 'tracker_status' not in meta:
+        meta['tracker_status'] = {}
+
+    # Filter trackers that are in both the list and tracker_class_map
+    valid_trackers = [tracker for tracker in trackers if tracker in tracker_class_map and tracker in http_trackers]
+    if "RTF" in trackers:
+        valid_trackers.append("RTF")
+
+    if valid_trackers:
+
+        async def validate_single_tracker(tracker_name):
+            """Validate credentials for a single tracker."""
+            try:
+                if tracker_name not in meta['tracker_status']:
+                    meta['tracker_status'][tracker_name] = {}
+
+                tracker_class = tracker_class_map[tracker_name](config=config)
+                if meta['debug']:
+                    console.print(f"[cyan]Validating {tracker_name} credentials...[/cyan]")
+                if tracker_name == "RTF":
+                    login = await tracker_class.api_test(meta)
+                else:
+                    login = await tracker_class.validate_credentials(meta)
+
+                if not login:
+                    meta['tracker_status'][tracker_name]['skipped'] = True
+
+                return tracker_name, login
+            except Exception as e:
+                console.print(f"[red]Error validating {tracker_name}: {e}[/red]")
+                meta['tracker_status'][tracker_name]['skipped'] = True
+                return tracker_name, False
+
+        # Run all tracker validations concurrently
+        await asyncio.gather(*[validate_single_tracker(tracker) for tracker in valid_trackers])
+
+
 async def process_meta(meta, base_dir, bot=None):
     """Process the metadata for each queued path."""
     if use_discord and bot:
@@ -151,7 +189,6 @@ async def process_meta(meta, base_dir, bot=None):
         if str(ua).lower() == "true":
             meta['unattended'] = True
             console.print("[yellow]Running in Auto Mode")
-    meta['base_dir'] = base_dir
     prep = Prep(screens=meta['screens'], img_host=meta['imghost'], config=config)
     try:
         results = await asyncio.gather(
@@ -305,7 +342,7 @@ async def process_meta(meta, base_dir, bot=None):
         trackers = meta['trackers']
 
         audio_prompted = False
-        for tracker in ["AITHER", "ASC", "BJS", "BT", "CBR", "DP", "FF", "GPW", "HUNO", "LDU", "OE", "PTS", "SAM", "SHRI", "SPD", "ULCX"]:
+        for tracker in ["AITHER", "ASC", "BJS", "BT", "CBR", "DP", "FF", "GPW", "HUNO", "LDU", "LT", "OE", "PTS", "SAM", "SHRI", "SPD", "ULCX"]:
             if tracker in trackers:
                 if not audio_prompted:
                     await process_desc_language(meta, desc=None, tracker=tracker)
@@ -324,6 +361,12 @@ async def process_meta(meta, base_dir, bot=None):
         with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/meta.json", 'w') as f:
             json.dump(meta, f, indent=4)
         await asyncio.sleep(0.2)
+
+        try:
+            await validate_tracker_logins(meta, trackers)
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Tracker validation encountered an error: {e}[/yellow]")
 
         successful_trackers = await process_all_trackers(meta)
 
@@ -774,6 +817,7 @@ async def do_the_thing(base_dir):
     if meta.get('current_version', ''):
         signature += f" {meta['current_version']}"
     meta['ua_signature'] = signature
+    meta['base_dir'] = base_dir
 
     cleanup_only = any(arg in ('--cleanup', '-cleanup') for arg in sys.argv) and len(sys.argv) <= 2
     sanitize_meta = config['DEFAULT'].get('sanitize_meta', True)
@@ -822,6 +866,7 @@ async def do_the_thing(base_dir):
         processed_files_count = 0
         skipped_files_count = 0
         base_meta = {k: v for k, v in meta.items()}
+
         for path in queue:
             total_files = len(queue)
             try:
@@ -933,16 +978,6 @@ async def do_the_thing(base_dir):
                     if not meta['debug'] or "debug" in os.path.basename(log_file):
                         if log_file:
                             await save_processed_file(log_file, path)
-                    await asyncio.sleep(0.1)
-                    if sanitize_meta:
-                        try:
-                            await asyncio.sleep(0.2)  # We can't race the status prints
-                            meta = await clean_meta_for_export(meta)
-                        except Exception as e:
-                            console.print(f"[red]Error cleaning meta for export: {e}")
-                    await cleanup()
-                    gc.collect()
-                    reset_terminal()
 
             if meta['debug']:
                 finish_time = time.time()
@@ -1001,13 +1036,6 @@ async def do_the_thing(base_dir):
                         if log_file:
                             await save_processed_file(log_file, path)
 
-            if sanitize_meta and not meta.get('emby', False):
-                try:
-                    await asyncio.sleep(0.3)  # We can't race the status prints
-                    meta = await clean_meta_for_export(meta)
-                except Exception as e:
-                    console.print(f"[red]Error cleaning meta for export: {e}")
-
             if meta.get('delete_tmp', False) and os.path.exists(tmp_path) and meta.get('emby', False):
                 try:
                     shutil.rmtree(tmp_path)
@@ -1018,7 +1046,26 @@ async def do_the_thing(base_dir):
 
             if 'limit_queue' in meta and int(meta['limit_queue']) > 0:
                 if (processed_files_count - skipped_files_count) >= int(meta['limit_queue']):
+                    if sanitize_meta and not meta.get('emby', False):
+                        try:
+                            await asyncio.sleep(0.2)  # We can't race the status prints
+                            meta = await clean_meta_for_export(meta)
+                        except Exception as e:
+                            console.print(f"[red]Error cleaning meta for export: {e}")
+                    await cleanup()
+                    gc.collect()
+                    reset_terminal()
                     break
+
+            if sanitize_meta and not meta.get('emby', False):
+                try:
+                    await asyncio.sleep(0.2)
+                    meta = await clean_meta_for_export(meta)
+                except Exception as e:
+                    console.print(f"[red]Error cleaning meta for export: {e}")
+            await cleanup()
+            gc.collect()
+            reset_terminal()
 
     except Exception as e:
         console.print(f"[bold red]An unexpected error occurred: {e}")
